@@ -1,0 +1,111 @@
+# Reusable Build Workflow
+# Called by all 3 service pipelines — DRY principle
+# Covers: OIDC auth, Docker build, ACR push, Maven cache, Docker cache
+
+name: Reusable Build
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+        description: "Name of the service (api-gateway, product-service, order-service)"
+      dockerfile-path:
+        required: true
+        type: string
+        description: "Path to Dockerfile"
+      context-path:
+        required: true
+        type: string
+        description: "Docker build context path"
+    outputs:
+      image-tag:
+        description: "The Docker image tag that was built and pushed"
+        value: ${{ jobs.build.outputs.image-tag }}
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      ACR_NAME:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── OIDC Auth to Azure (no secrets stored in GitHub!) ───────
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── Set image tag from commit SHA ────────────────────────────
+      - name: Set image tag
+        id: meta
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full-image=${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.service-name }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      # ── Maven cache (for order-service Java builds) ──────────────
+      - name: Cache Maven packages
+        if: inputs.service-name == 'order-service'
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # ── pip cache (for product-service Python builds) ────────────
+      - name: Cache pip packages
+        if: inputs.service-name == 'product-service'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── Setup Docker Buildx (for layer caching) ──────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Login to ACR ─────────────────────────────────────────────
+      - name: Login to ACR
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      # ── Build and Push with Docker layer cache ───────────────────
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context-path }}
+          file: ${{ inputs.dockerfile-path }}
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.service-name }}:${{ github.sha }}
+            ${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.service-name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Security scan with Trivy ─────────────────────────────────
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.service-name }}:${{ github.sha }}"
+          format: "table"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH"
